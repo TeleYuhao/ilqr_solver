@@ -1,106 +1,282 @@
 #pragma once
 
 #include "cost_base.hpp"
-#include "config.hpp"
+#include <Eigen/Core>
+#include <cmath>
 
 namespace ilqr {
 
-template<typename T = double>
-class ControlConstraint : public CostFunc<T, 4, 2> {
+/**
+ * @brief Control constraint cost using exponential barriers
+ *
+ * Implements soft constraints on acceleration and steering limits using
+ * exponential barrier functions:
+ *   b = q1 * exp(q2 * constraint)
+ *
+ * Corresponds to Python's ControlConstraint class in ControlConstraint.py.
+ *
+ * Constraints:
+ *   - Acceleration upper: a <= a_max
+ *   - Acceleration lower: a >= a_min
+ *   - Steering upper: delta <= delta_max
+ *   - Steering lower: delta >= delta_min
+ */
+class ControlConstraint : public CostFunc<double, 4, 2> {
 public:
-    ILQR_PROBLEM_VARIABLES(T, 4, 2);
+    // Type definitions
+    ILQR_PROBLEM_VARIABLES(double, 4, 2)
 
-    ControlConstraint() = default;
+    // Constraint bounds
+    static constexpr double V_MAX = 10.0;
+    static constexpr double V_MIN = 0.0;
+    static constexpr double A_MAX = 2.0;
+    static constexpr double A_MIN = -2.0;
+    static constexpr double DELTA_MAX = 1.57;
+    static constexpr double DELTA_MIN = -1.57;
 
-    bool value(int step, const State& state, const Control& ctrl, T& val) const override {
-        T a = ctrl(0);
-        T delta = ctrl(1);
+    // Barrier parameters (from cost_base.py)
+    static constexpr double Q1 = 5.5;
+    static constexpr double Q2 = 5.75;
+
+    /**
+     * @brief Constructor
+     *
+     * @param state_dim State dimension (default 4)
+     * @param control_dim Control dimension (default 2)
+     */
+    ControlConstraint(int state_dim = 4, int control_dim = 2)
+        : CostFunc<double, 4, 2>(state_dim, control_dim) {}
+
+    /**
+     * @brief Destructor
+     */
+    ~ControlConstraint() override = default;
+
+    /**
+     * @brief Compute cost function value
+     *
+     * Sum of exponential barrier costs for all 4 constraints:
+     *   L = barrier(a - a_max) + barrier(a_min - a)
+     *     + barrier(delta - delta_max) + barrier(delta_min - delta)
+     *
+     * @param step Time step
+     * @param state Current state [x, y, v, yaw]
+     * @param ctrl Current control [acceleration, steering]
+     * @param val Output parameter for cost value
+     * @return true if computation successful
+     */
+    inline bool value(int step,
+                      const State& state,
+                      const Control& ctrl,
+                      double& val) const override {
+        double a = ctrl(0);      // acceleration
+        double delta = ctrl(1);  // steering angle
 
         // Acceleration constraints
-        T acc_up_constr = this->exp_barrier(
-            this->get_bound_constr(a, config::A_MAX, true));
-        T acc_low_constr = this->exp_barrier(
-            this->get_bound_constr(a, config::A_MIN, false));
+        double acc_up_constraint = get_bound_constr(a, A_MAX, true);   // a - a_max
+        double acc_low_constraint = get_bound_constr(a, A_MIN, false);  // a_min - a
 
-        // Steering angle constraints
-        T delta_up_constr = this->exp_barrier(
-            this->get_bound_constr(delta, config::DELTA_MAX, true));
-        T delta_low_constr = this->exp_barrier(
-            this->get_bound_constr(delta, config::DELTA_MIN, false));
+        // Steering constraints
+        double delta_up_constraint = get_bound_constr(delta, DELTA_MAX, true);   // delta - delta_max
+        double delta_low_constraint = get_bound_constr(delta, DELTA_MIN, false); // delta_min - delta
 
-        val = acc_up_constr + acc_low_constr + delta_up_constr + delta_low_constr;
+        // Sum of barrier costs
+        val = exp_barrier(acc_up_constraint) +
+              exp_barrier(acc_low_constraint) +
+              exp_barrier(delta_up_constraint) +
+              exp_barrier(delta_low_constraint);
+
         return true;
     }
 
-    bool gradient_lx(int step, const State& state, const Control& ctrl, VecX& lx) const override {
+    /**
+     * @brief Compute cost gradient with respect to state
+     *
+     * Control constraints don't depend on state, so gradient is zero.
+     *
+     * @param step Time step
+     * @param state Current state
+     * @param ctrl Current control
+     * @param lx Output parameter for gradient (4,)
+     * @return true if computation successful
+     */
+    inline bool gradient_lx(int step,
+                            const State& state,
+                            const Control& ctrl,
+                            VecX& lx) const override {
         lx = VecX::Zero();
         return true;
     }
 
-    bool gradient_lu(int step, const State& state, const Control& ctrl, VecU& lu) const override {
-        T a = ctrl(0);
-        T delta = ctrl(1);
+    /**
+     * @brief Compute cost gradient with respect to control
+     *
+     * Applies chain rule through barrier functions:
+     *   ∂L/∂u = Σ ∂barrier/∂constraint * ∂constraint/∂u
+     *
+     * @param step Time step
+     * @param state Current state
+     * @param ctrl Current control
+     * @param lu Output parameter for gradient (2,)
+     * @return true if computation successful
+     */
+    inline bool gradient_lu(int step,
+                            const State& state,
+                            const Control& ctrl,
+                            VecU& lu) const override {
+        double a = ctrl(0);      // acceleration
+        double delta = ctrl(1);  // steering angle
 
-        // Acceleration constraint derivatives (da/da = 1, da/ddelta = 0)
-        T acc_up_constr = this->get_bound_constr(a, config::A_MAX, true);
-        T acc_low_constr = this->get_bound_constr(a, config::A_MIN, false);
-        T acc_up_grad = config::EXP_Q2 * this->exp_barrier(acc_up_constr);
-        T acc_low_grad = -config::EXP_Q2 * this->exp_barrier(acc_low_constr);  // Negative for lower bound
+        // Constraint derivatives w.r.t. control [∂constraint/∂a, ∂constraint/∂delta]
+        VecU acc_up_constraint_du;   acc_up_constraint_du <<  1.0,  0.0;
+        VecU acc_low_constraint_du;  acc_low_constraint_du << -1.0,  0.0;
+        VecU delta_up_constraint_du; delta_up_constraint_du <<  0.0,  1.0;
+        VecU delta_low_constraint_du; delta_low_constraint_du <<  0.0, -1.0;
 
-        // Steering constraint derivatives (ddelta/da = 0, ddelta/ddelta = 1)
-        T delta_up_constr = this->get_bound_constr(delta, config::DELTA_MAX, true);
-        T delta_low_constr = this->get_bound_constr(delta, config::DELTA_MIN, false);
-        T delta_up_grad = config::EXP_Q2 * this->exp_barrier(delta_up_constr);
-        T delta_low_grad = -config::EXP_Q2 * this->exp_barrier(delta_low_constr);  // Negative for lower bound
+        // Constraint values
+        double acc_up_constraint = get_bound_constr(a, A_MAX, true);
+        double acc_low_constraint = get_bound_constr(a, A_MIN, false);
+        double delta_up_constraint = get_bound_constr(delta, DELTA_MAX, true);
+        double delta_low_constraint = get_bound_constr(delta, DELTA_MIN, false);
 
-        lu << acc_up_grad + acc_low_grad, delta_up_grad + delta_low_grad;
+        // Sum of barrier Jacobians using chain rule
+        // b_dot = q2 * b * c_dot where b = q1 * exp(q2 * c)
+        lu = VecU::Zero();
+
+        // Acceleration upper constraint
+        double b = exp_barrier(acc_up_constraint);
+        lu += Q2 * b * acc_up_constraint_du;
+
+        // Acceleration lower constraint
+        b = exp_barrier(acc_low_constraint);
+        lu += Q2 * b * acc_low_constraint_du;
+
+        // Steering upper constraint
+        b = exp_barrier(delta_up_constraint);
+        lu += Q2 * b * delta_up_constraint_du;
+
+        // Steering lower constraint
+        b = exp_barrier(delta_low_constraint);
+        lu += Q2 * b * delta_low_constraint_du;
 
         return true;
     }
 
-    bool hessian_lxx(int step, const State& state, const Control& ctrl, MatrixLXX& lxx) const override {
+    /**
+     * @brief Compute cost Hessian with respect to state
+     *
+     * Control constraints don't depend on state, so Hessian is zero.
+     *
+     * @param step Time step
+     * @param state Current state
+     * @param ctrl Current control
+     * @param lxx Output parameter for Hessian (4x4)
+     * @return true if computation successful
+     */
+    inline bool hessian_lxx(int step,
+                            const State& state,
+                            const Control& ctrl,
+                            MatrixLXX& lxx) const override {
         lxx = MatrixLXX::Zero();
         return true;
     }
 
-    bool hessian_luu(int step, const State& state, const Control& ctrl, MatrixLUU& luu) const override {
-        T a = ctrl(0);
-        T delta = ctrl(1);
+    /**
+     * @brief Compute cost Hessian with respect to control
+     *
+     * Applies chain rule through barrier functions:
+     *   ∂²L/∂u² = Σ ∂²barrier/∂constraint² * ∂constraint/∂u * ∂constraint/∂u.T
+     *
+     * @param step Time step
+     * @param state Current state
+     * @param ctrl Current control
+     * @param luu Output parameter for Hessian (2x2)
+     * @return true if computation successful
+     */
+    inline bool hessian_luu(int step,
+                            const State& state,
+                            const Control& ctrl,
+                            MatrixLUU& luu) const override {
+        double a = ctrl(0);      // acceleration
+        double delta = ctrl(1);  // steering angle
 
-        // Acceleration constraint second derivatives
-        VecU acc_up_constr_du;
-        acc_up_constr_du << T(1), T(0);
-        VecU acc_low_constr_du;
-        acc_low_constr_du << T(-1), T(0);
+        // Constraint derivatives w.r.t. control
+        VecU acc_up_constraint_du;   acc_up_constraint_du <<  1.0,  0.0;
+        VecU acc_low_constraint_du;  acc_low_constraint_du << -1.0,  0.0;
+        VecU delta_up_constraint_du; delta_up_constraint_du <<  0.0,  1.0;
+        VecU delta_low_constraint_du; delta_low_constraint_du <<  0.0, -1.0;
 
-        T acc_up_constr = this->get_bound_constr(a, config::A_MAX, true);
-        T acc_low_constr = this->get_bound_constr(a, config::A_MIN, false);
-        T acc_up_hess = config::EXP_Q2 * config::EXP_Q2 * this->exp_barrier(acc_up_constr);
-        T acc_low_hess = config::EXP_Q2 * config::EXP_Q2 * this->exp_barrier(acc_low_constr);
+        // Constraint values
+        double acc_up_constraint = get_bound_constr(a, A_MAX, true);
+        double acc_low_constraint = get_bound_constr(a, A_MIN, false);
+        double delta_up_constraint = get_bound_constr(delta, DELTA_MAX, true);
+        double delta_low_constraint = get_bound_constr(delta, DELTA_MIN, false);
 
-        // Steering constraint second derivatives
-        VecU delta_up_constr_du;
-        delta_up_constr_du << T(0), T(1);
-        VecU delta_low_constr_du;
-        delta_low_constr_du << T(0), T(-1);
+        // Sum of barrier Hessians using chain rule
+        // b_ddot = (q2^2) * b * (c_dot @ c_dot.T)
+        luu = MatrixLUU::Zero();
 
-        T delta_up_constr = this->get_bound_constr(delta, config::DELTA_MAX, true);
-        T delta_low_constr = this->get_bound_constr(delta, config::DELTA_MIN, false);
-        T delta_up_hess = config::EXP_Q2 * config::EXP_Q2 * this->exp_barrier(delta_up_constr);
-        T delta_low_hess = config::EXP_Q2 * config::EXP_Q2 * this->exp_barrier(delta_low_constr);
+        // Acceleration upper constraint
+        double b = exp_barrier(acc_up_constraint);
+        luu += (Q2 * Q2) * b * (acc_up_constraint_du * acc_up_constraint_du.transpose());
 
-        luu = acc_up_hess * (acc_up_constr_du * acc_up_constr_du.transpose()) +
-              acc_low_hess * (acc_low_constr_du * acc_low_constr_du.transpose()) +
-              delta_up_hess * (delta_up_constr_du * delta_up_constr_du.transpose()) +
-              delta_low_hess * (delta_low_constr_du * delta_low_constr_du.transpose());
+        // Acceleration lower constraint
+        b = exp_barrier(acc_low_constraint);
+        luu += (Q2 * Q2) * b * (acc_low_constraint_du * acc_low_constraint_du.transpose());
+
+        // Steering upper constraint
+        b = exp_barrier(delta_up_constraint);
+        luu += (Q2 * Q2) * b * (delta_up_constraint_du * delta_up_constraint_du.transpose());
+
+        // Steering lower constraint
+        b = exp_barrier(delta_low_constraint);
+        luu += (Q2 * Q2) * b * (delta_low_constraint_du * delta_low_constraint_du.transpose());
 
         return true;
     }
 
-    bool hessian_lxu(int step, const State& state, const Control& ctrl, MatrixLXU& lxu) const override {
+    /**
+     * @brief Compute mixed cost Hessian (state x control)
+     *
+     * Control constraints don't depend on state, so mixed Hessian is zero.
+     *
+     * @param step Time step
+     * @param state Current state
+     * @param ctrl Current control
+     * @param lxu Output parameter for Hessian (4x2)
+     * @return true if computation successful
+     */
+    inline bool hessian_lxu(int step,
+                            const State& state,
+                            const Control& ctrl,
+                            MatrixLXU& lxu) const override {
         lxu = MatrixLXU::Zero();
         return true;
     }
+
+    /**
+     * @brief Get acceleration maximum bound
+     * @return a_max in m/s²
+     */
+    static constexpr double get_a_max() { return A_MAX; }
+
+    /**
+     * @brief Get acceleration minimum bound
+     * @return a_min in m/s²
+     */
+    static constexpr double get_a_min() { return A_MIN; }
+
+    /**
+     * @brief Get steering maximum bound
+     * @return delta_max in radians
+     */
+    static constexpr double get_delta_max() { return DELTA_MAX; }
+
+    /**
+     * @brief Get steering minimum bound
+     * @return delta_min in radians
+     */
+    static constexpr double get_delta_min() { return DELTA_MIN; }
 };
 
 } // namespace ilqr

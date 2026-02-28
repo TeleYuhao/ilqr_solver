@@ -1,296 +1,534 @@
-#pragma once
+/**
+ * @file ilqr_solver.hpp
+ * @brief iLQR (Iterative Linear Quadratic Regulator) solver
+ *
+ * Implements the iLQR algorithm for trajectory optimization with:
+ * - Riccati backward recursion for computing gains
+ * - Line search forward pass
+ * - Adaptive regularization (lambda)
+ */
 
+#ifndef ILQR_ILQR_SOLVER_HPP
+#define ILQR_ILQR_SOLVER_HPP
+
+#include "common_variable.hpp"
 #include "model_base.hpp"
 #include "cost_calculator.hpp"
-#include "config.hpp"
+#include "kinematic_model.hpp"
+
+#include <vector>
+#include <memory>
 #include <iostream>
 #include <cmath>
 
 namespace ilqr {
 
-template<typename T = double>
+/**
+ * @brief iLQR solver for trajectory optimization
+ *
+ * Iteratively linearizes the dynamics and quadraticizes the cost
+ * to compute locally optimal feedback control policies.
+ */
 class ILQRSolver {
 public:
-    typedef Model<T, 4, 2> KinematicModelType;
-    typedef CostCalculator<T> CostCalculatorType;
+    // Type definitions
+    ILQR_PROBLEM_VARIABLES(double, 4, 2)
 
-    // Matrix types for trajectory storage (row-major: N+1 x 4 for states, N x 2 for controls)
-    typedef Matrix<T, Dynamic, 4> States;
-    typedef Matrix<T, Dynamic, 2> Controls;
-    typedef Matrix<T, 4, 1> VecX;
-    typedef Matrix<T, 2, 1> VecU;
-    typedef Matrix<T, 4, 4> MatrixLXX;
-    typedef Matrix<T, 2, 2> MatrixLUU;
-    typedef Matrix<T, 4, 2> MatrixLXU;
+    // Dimension constants
+    static constexpr int STATE_DIM = 4;
+    static constexpr int CONTROL_DIM = 2;
 
-    // Vector types for cost derivatives (aligned allocator for Eigen types in std::vector)
-    typedef std::vector<VecX, Eigen::aligned_allocator<VecX>> VecXs;
-    typedef std::vector<VecU, Eigen::aligned_allocator<VecU>> VecUs;
-    typedef std::vector<MatrixLXX, Eigen::aligned_allocator<MatrixLXX>> MatrixCXXs;
-    typedef std::vector<MatrixLUU, Eigen::aligned_allocator<MatrixLUU>> MatrixCUUs;
-    typedef std::vector<MatrixLXU, Eigen::aligned_allocator<MatrixLXU>> MatrixCXUs;
+    // Default parameters
+    static constexpr int DEFAULT_HORIZON = 60;
+    static constexpr double DEFAULT_DT = 0.1;
+    static constexpr int DEFAULT_MAX_ITER = 50;
+    static constexpr double DEFAULT_INIT_LAMBDA = 20.0;
+    static constexpr double DEFAULT_LAMBDA_DECAY = 0.7;
+    static constexpr double DEFAULT_LAMBDA_AMPLIFY = 2.0;
+    static constexpr double DEFAULT_MAX_LAMBDA = 10000.0;
+    static constexpr double DEFAULT_TOL = 0.001;
 
-    ILQRSolver(KinematicModelType* model, CostCalculatorType* cost_func)
-        : model_(model), cost_func_(cost_func),
-          N_(config::HORIZON_LENGTH), dt_(config::DT),
-          max_iter_(config::MAX_ITER),
-          init_lamb_(config::INIT_LAMB),
-          lamb_decay_(config::LAMB_DECAY),
-          lamb_amplify_(config::LAMB_AMPLIFY),
-          max_lamb_(config::MAX_LAMB),
-          tol_(config::TOL) {
-
-        alpha_options_ = {T(1), T(0.5), T(0.25), T(0.125), T(0.0625)};
+    /**
+     * @brief Constructor
+     *
+     * @param model Kinematic model pointer
+     * @param cost_calculator Cost function calculator
+     * @param horizon Planning horizon
+     */
+    ILQRSolver(KinematicModel* model,
+               CostCalculator* cost_calculator,
+               int horizon = DEFAULT_HORIZON)
+        : model_(model)
+        , cost_calculator_(cost_calculator)
+        , horizon_(horizon)
+        , state_dim_(4)
+        , control_dim_(2)
+        , dt_(DEFAULT_DT)
+        , max_iter_(DEFAULT_MAX_ITER)
+        , init_lamb_(DEFAULT_INIT_LAMBDA)
+        , lamb_decay_(DEFAULT_LAMBDA_DECAY)
+        , lamb_amplify_(DEFAULT_LAMBDA_AMPLIFY)
+        , max_lamb_(DEFAULT_MAX_LAMBDA)
+        , tol_(DEFAULT_TOL)
+    {
+        // Initialize alpha options for line search
+        alpha_options_ = {1.0, 0.5, 0.25, 0.125, 0.0625};
     }
 
-    // Test access methods (for comprehensive testing)
-    std::tuple<Controls, std::vector<Matrix<T, 2, 4>>, T>
-    test_backward_pass(const Controls& u, const States& x, T lamb, int debug_iter = -1) {
-        return backward_pass(u, x, lamb, debug_iter);
-    }
-
-    std::pair<Controls, States>
-    test_forward_pass(const Controls& u, const States& x,
-                     const std::vector<Matrix<T, 2, 4>>& K,
-                     const Controls& d, T alpha) {
-        return forward_pass(u, x, d, K, alpha);
-    }
-
-    std::tuple<Controls, States, T, bool>
-    test_iter(const Controls& u, const States& x, T J, T lamb, int current_iter = 0) {
-        return iter(u, x, J, lamb, current_iter);
-    }
-
-    std::pair<Controls, States> solve(const typename KinematicModelType::State& x0) {
-        // Initialize with zero controls
-        Controls init_u = Controls::Zero(N_, 2);
-        States init_x = States::Zero(N_ + 1, 4);
-        init_x.row(0) = x0.transpose();
-
-        // Propagate dynamics forward to get initial trajectory
-        for (int i = 0; i < N_; ++i) {
-            typename KinematicModelType::State state_i = init_x.row(i).transpose();
-            typename KinematicModelType::Control ctrl_i = init_u.row(i).transpose();
-            typename KinematicModelType::State next_state = model_->forward_calculation(state_i, ctrl_i, dt_);
-            init_x.row(i + 1) = next_state.transpose();
-        }
-
-        // Convert to vector types for cost calculation (use aligned_allocator)
-        std::vector<typename KinematicModelType::State, Eigen::aligned_allocator<typename KinematicModelType::State>> state_vec(N_ + 1);
-        std::vector<typename KinematicModelType::Control, Eigen::aligned_allocator<typename KinematicModelType::Control>> ctrl_vec(N_);
-        for (int i = 0; i <= N_; ++i) {
-            state_vec[i] = init_x.row(i).transpose();
-        }
-        for (int i = 0; i < N_; ++i) {
-            ctrl_vec[i] = init_u.row(i).transpose();
-        }
-
-        T J = cost_func_->CalculateTotalCost(state_vec, ctrl_vec);
-        Controls u = init_u;
-        States x = init_x;
-
-        T lamb = init_lamb_;
-
-        for (int itr = 0; itr < max_iter_; ++itr) {
-            auto [new_u, new_x, new_J, effective] = iter(u, x, J, lamb, itr);
-
-            std::cout << "Iteration " << itr << ", Cost: " << new_J
-                      << ", Lambda: " << lamb << ", Effective: " << effective << std::endl;
-
-            if (effective) {
-                x = new_x;
-                u = new_u;
-                T J_old = J;
-                J = new_J;
-
-                if (std::abs(J - J_old) < tol_) {
-                    std::cout << "Tolerance condition satisfied. " << itr << std::endl;
-                    break;
-                }
-
-                lamb *= lamb_decay_;
-            } else {
-                lamb *= lamb_amplify_;
-
-                if (lamb > max_lamb_) {
-                    std::cout << "Regularization parameter reached maximum." << std::endl;
-                    break;
-                }
-            }
-        }
-
-        return {u, x};
-    }
-
-private:
-    std::tuple<Controls, States, T, bool>
-    iter(const Controls& u, const States& x, T J, T lamb, int current_iter = 0) {
-        auto [d, K, exp_redu] = backward_pass(u, x, lamb, current_iter);
-
-        bool iter_effective_flag = false;
-        Controls new_u = Controls::Zero(N_, 2);
-        States new_x = States::Zero(N_ + 1, 4);
-        T new_J = std::numeric_limits<T>::max();
-
-        for (T alpha : alpha_options_) {
-            auto [u_updated, x_updated] = forward_pass(u, x, d, K, alpha);
-
-            // Convert to vector types for cost calculation (use aligned_allocator)
-            std::vector<typename KinematicModelType::State, Eigen::aligned_allocator<typename KinematicModelType::State>> state_vec(N_ + 1);
-            std::vector<typename KinematicModelType::Control, Eigen::aligned_allocator<typename KinematicModelType::Control>> ctrl_vec(N_);
-            for (int i = 0; i <= N_; ++i) {
-                state_vec[i] = x_updated.row(i).transpose();
-            }
-            for (int i = 0; i < N_; ++i) {
-                ctrl_vec[i] = u_updated.row(i).transpose();
-            }
-
-            new_J = cost_func_->CalculateTotalCost(state_vec, ctrl_vec);
-
-            if (new_J < J) {
-                new_u = u_updated;
-                new_x = x_updated;
-                iter_effective_flag = true;
-                break;
-            }
-        }
-
-        return {new_u, new_x, new_J, iter_effective_flag};
-    }
-
-    std::tuple<Controls, std::vector<Matrix<T, 2, 4>>, T>
-    backward_pass(const Controls& u, const States& x, T lamb, int debug_iter = -1) {
-        // Update reference states and calculate derivatives
-        Matrix<T, Eigen::Dynamic, 2> positions(x.rows(), 2);
-        for (int i = 0; i < x.rows(); ++i) {
-            positions.row(i) << x(i, 0), x(i, 1);
-        }
-        cost_func_->getStateCost()->get_ref_states(positions);
-
-        // Convert matrix types to vector types for cost calculation (use aligned_allocator)
-        std::vector<typename KinematicModelType::State, Eigen::aligned_allocator<typename KinematicModelType::State>> state_vec(N_ + 1);
-        std::vector<typename KinematicModelType::Control, Eigen::aligned_allocator<typename KinematicModelType::Control>> ctrl_vec(N_);
-        for (int i = 0; i <= N_; ++i) {
-            state_vec[i] = x.row(i).transpose();
-        }
-        for (int i = 0; i < N_; ++i) {
-            ctrl_vec[i] = u.row(i).transpose();
-        }
-
+    /**
+     * @brief Backward pass: Riccati recursion to compute gains
+     *
+     * Computes feedforward gains (d) and feedback gains (K) by backward
+     * recursion through time, using the Riccati equation.
+     *
+     * @param controls Current control trajectory
+     * @param states Current state trajectory
+     * @param lambda Regularization parameter
+     * @param d Output: feedforward gains (horizon x 2)
+     * @param K Output: feedback gains (horizon x 2x4)
+     * @param delt_V Output: expected cost reduction
+     * @return true if successful
+     */
+    bool backward_pass(const Controls& controls,
+                       const States& states,
+                       double lambda,
+                       Controls& d,
+                       MatrixCUXs& K,
+                       double& delt_V) {
+        // Get cost derivatives
         VecXs lx;
         MatrixCXXs lxx;
         VecUs lu;
         MatrixCUUs luu;
         MatrixCXUs lxu;
-        cost_func_->CalculateDerivates(state_vec, ctrl_vec, lx, lxx, lu, luu, lxu);
 
-        // Initialize value function from terminal cost
-        VecX V_x = lx[N_];  // Terminal state gradient
-        MatrixLXX V_xx = lxx[N_];  // Terminal state Hessian
+        cost_calculator_->CalculateDerivatives(states, controls, lx, lxx, lu, luu, lxu);
 
-        // Feedback and feedforward gains
-        Controls d = Controls::Zero(N_, 2);
-        std::vector<Matrix<T, 2, 4>> K(N_);
-        for (int i = 0; i < N_; ++i) {
-            K[i] = Matrix<T, 2, 4>::Zero();
-        }
+        // Initialize value function at terminal time
+        VecX V_x = lx[horizon_];
+        MatrixLXX V_xx = lxx[horizon_];
 
-        T delt_V = T(0);
-        MatrixLXX regu_I = lamb * MatrixLXX::Identity();
+        // Resize outputs
+        d.resize(horizon_);
+        K.resize(horizon_);
 
-        // Backward pass from N-1 to 0
-        for (int i = N_ - 1; i >= 0; --i) {
-            typename KinematicModelType::State state_i = x.row(i).transpose();
-            typename KinematicModelType::Control ctrl_i = u.row(i).transpose();
+        // Initialize expected cost reduction
+        delt_V = 0.0;
 
-            Matrix<T, 4, 4> dfdx = model_->gradient_fx(state_i, ctrl_i, dt_);
-            Matrix<T, 4, 2> dfdu = model_->gradient_fu(state_i, ctrl_i, dt_);
+        // Regularization matrix
+        MatrixLXX regu_I = lambda * MatrixLXX::Identity();
 
-            // Q-function terms
-            VecX Q_x = lx[i] + dfdx.transpose() * V_x;
-            VecU Q_u = lu[i] + dfdu.transpose() * V_x;
-            MatrixLXX Q_xx = lxx[i] + dfdx.transpose() * V_xx * dfdx;
-            MatrixLUU Q_uu = luu[i] + dfdu.transpose() * V_xx * dfdu;
-            Matrix<T, 2, 4> Q_ux = lxu[i].transpose() + dfdu.transpose() * V_xx * dfdx;
+        // Backward recursion
+        for (int i = horizon_ - 1; i >= 0; --i) {
+            // Get dynamics Jacobians
+            MatrixLXX fx = model_->gradient_fx(states[i], controls[i]);
+            MatrixLXU fu = model_->gradient_fu(states[i], controls[i]);
 
-            // Compute gains with regularization
-            Matrix<T, 2, 4> dfdu_regu = dfdu.transpose() * regu_I;
-            Matrix<T, 2, 4> Q_ux_regu = Q_ux + dfdu_regu * dfdx;
-            MatrixLUU Q_uu_regu = Q_uu + dfdu_regu * dfdu;
+            // Q terms - using explicit computations to avoid Eigen template issues
 
-            // Use LDLT decomposition for better numerical stability (matches Python's np.linalg.inv)
-            Eigen::LDLT<MatrixLUU> ldlt(Q_uu_regu);
-            MatrixLUU Q_uu_inv = MatrixLUU::Identity();
-            ldlt.solveInPlace(Q_uu_inv);
+            // Q_x = lx[i] + fx^T * V_x (4x1)
+            VecX Q_x; Q_x.setZero();
+            for (int r = 0; r < STATE_DIM; ++r) {
+                Q_x(r) = lx[i](r);
+                for (int k = 0; k < STATE_DIM; ++k) {
+                    Q_x(r) += fx(k, r) * V_x(k);
+                }
+            }
 
-            d.row(i) = -Q_uu_inv * Q_u;
+            // Q_u = lu[i] + fu^T * V_x (2x1)
+            VecU Q_u; Q_u.setZero();
+            for (int r = 0; r < 2; ++r) {
+                Q_u(r) = lu[i](r);
+                for (int k = 0; k < STATE_DIM; ++k) {
+                    Q_u(r) += fu(k, r) * V_x(k);
+                }
+            }
+
+            // Q_xx = lxx[i] + fx^T * V_xx * fx (4x4)
+            MatrixLXX Q_xx; Q_xx.setZero();
+            // First compute temp = V_xx * fx (4x4 @ 4x4 = 4x4)
+            MatrixLXX temp_Vxx_fx; temp_Vxx_fx.setZero();
+            for (int r = 0; r < STATE_DIM; ++r) {
+                for (int c = 0; c < 4; ++c) {
+                    for (int k = 0; k < STATE_DIM; ++k) {
+                        temp_Vxx_fx(r, c) += V_xx(r, k) * fx(k, c);
+                    }
+                }
+            }
+            // Then Q_xx = lxx + fx^T * temp (4x4)
+            for (int r = 0; r < STATE_DIM; ++r) {
+                for (int c = 0; c < 4; ++c) {
+                    Q_xx(r, c) = lxx[i](r, c);
+                    for (int k = 0; k < STATE_DIM; ++k) {
+                        Q_xx(r, c) += fx(k, r) * temp_Vxx_fx(k, c);
+                    }
+                }
+            }
+
+            // Q_uu = luu[i] + fu^T * V_xx * fu (2x2)
+            MatrixLUU Q_uu; Q_uu.setZero();
+            // First compute temp = V_xx * fu (4x4 @ 4x2 = 4x2)
+            MatrixLXU temp_Vxx_fu; temp_Vxx_fu.setZero();
+            for (int r = 0; r < STATE_DIM; ++r) {
+                for (int c = 0; c < CONTROL_DIM; ++c) {
+                    for (int k = 0; k < STATE_DIM; ++k) {
+                        temp_Vxx_fu(r, c) += V_xx(r, k) * fu(k, c);
+                    }
+                }
+            }
+            // Then Q_uu = luu + fu^T * temp (2x2)
+            for (int r = 0; r < 2; ++r) {
+                for (int c = 0; c < CONTROL_DIM; ++c) {
+                    Q_uu(r, c) = luu[i](r, c);
+                    for (int k = 0; k < STATE_DIM; ++k) {
+                        Q_uu(r, c) += fu(k, r) * temp_Vxx_fu(k, c);
+                    }
+                }
+            }
+
+            // Q_ux = lxu[i]^T + fu^T * V_xx * fx (2x4)
+            // Note: lxu[i] is 4x2, so lxu[i]^T is 2x4
+            MatrixLUX Q_ux; Q_ux.setZero();
+            // Transpose lxu
+            for (int r = 0; r < 2; ++r) {
+                for (int c = 0; c < 4; ++c) {
+                    Q_ux(r, c) = lxu[i](c, r);
+                }
+            }
+            // Add fu^T * temp_Vxx_fx (2x4)
+            for (int r = 0; r < 2; ++r) {
+                for (int c = 0; c < 4; ++c) {
+                    for (int k = 0; k < STATE_DIM; ++k) {
+                        Q_ux(r, c) += fu(k, r) * temp_Vxx_fx(k, c);
+                    }
+                }
+            }
+
+            // Add regularization
+            // Q_ux_regu = Q_ux + fu^T * regu_I * fx = Q_ux + (fu^T * regu_I) * fx
+            // First compute fu^T * regu_I (2x4 @ 4x4 = 2x4)
+            MatrixLUX fuT_regu; fuT_regu.setZero();
+            for (int r = 0; r < 2; ++r) {
+                for (int c = 0; c < 4; ++c) {
+                    for (int k = 0; k < STATE_DIM; ++k) {
+                        fuT_regu(r, c) += fu(k, r) * regu_I(k, c);
+                    }
+                }
+            }
+            // Then Q_ux_regu = Q_ux + fuT_regu * fx (2x4 @ 4x4 = 2x4)
+            MatrixLUX Q_ux_regu; Q_ux_regu.setZero();
+            for (int r = 0; r < 2; ++r) {
+                for (int c = 0; c < 4; ++c) {
+                    Q_ux_regu(r, c) = Q_ux(r, c);
+                    for (int k = 0; k < STATE_DIM; ++k) {
+                        Q_ux_regu(r, c) += fuT_regu(r, k) * fx(k, c);
+                    }
+                }
+            }
+
+            // Q_uu_regu = Q_uu + fu^T * regu_I * fu = Q_uu + fuT_regu * fu
+            MatrixLUU Q_uu_regu; Q_uu_regu.setZero();
+            for (int r = 0; r < 2; ++r) {
+                for (int c = 0; c < CONTROL_DIM; ++c) {
+                    Q_uu_regu(r, c) = Q_uu(r, c);
+                    for (int k = 0; k < STATE_DIM; ++k) {
+                        Q_uu_regu(r, c) += fuT_regu(r, k) * fu(k, c);
+                    }
+                }
+            }
+
+            // Invert Q_uu_regu
+            Eigen::ColPivHouseholderQR<MatrixLUU> qr(Q_uu_regu);
+            if (!qr.isInvertible()) {
+                return false;
+            }
+            MatrixLUU Q_uu_inv = qr.inverse();
+
+            // Compute gains
+            d[i] = -Q_uu_inv * Q_u;
             K[i] = -Q_uu_inv * Q_ux_regu;
 
-            // Update value function
-            V_x = Q_x + K[i].transpose() * Q_uu * d.row(i).transpose() +
-                  K[i].transpose() * Q_u + Q_ux.transpose() * d.row(i).transpose();
-            V_xx = Q_xx + K[i].transpose() * Q_uu * K[i] +
-                   K[i].transpose() * Q_ux + Q_ux.transpose() * K[i];
+            // Update value function (using explicit computations to avoid Eigen template issues)
+            // V_x = Q_x + K.T @ Q_uu @ d + K.T @ Q_u + Q_ux.T @ d
 
-            // Expected cost reduction (extract scalar from 1x1 matrix)
-            T term1 = (T(0.5) * d.row(i) * Q_uu * d.row(i).transpose()).value();
-            T term2 = (d.row(i) * Q_u).value();
-            delt_V += term1 + term2;
+            // Compute K.T @ Q_uu @ d
+            VecX KtQ_uu_d; KtQ_uu_d.setZero();
+            for (int r = 0; r < STATE_DIM; ++r) {
+                for (int c = 0; c < CONTROL_DIM; ++c) {
+                    KtQ_uu_d(r) += K[i](c, r) * (Q_uu(c, 0) * d[i](0) + Q_uu(c, 1) * d[i](1));
+                }
+            }
 
-            // Debug output for last step of backward pass (step 59)
-            if (debug_iter == 0 && i == N_ - 1) {
-                std::cout << "=== Backward Pass Debug (iter=" << debug_iter << ", step=" << i << ") ===" << std::endl;
-                std::cout << "Q_uu_regu:\n" << Q_uu_regu << std::endl;
-                std::cout << "Q_uu_inv:\n" << Q_uu_inv << std::endl;
-                std::cout << "d.row(" << i << "):\n" << d.row(i) << std::endl;
-                std::cout << "K[" << i << "]:\n" << K[i] << std::endl;
-                std::cout << "Q_x:\n" << Q_x.transpose() << std::endl;
-                std::cout << "Q_u:\n" << Q_u.transpose() << std::endl;
-                std::cout << "V_x (after update):\n" << V_x.transpose() << std::endl;
-                std::cout << "V_xx (after update):\n" << V_xx << std::endl;
+            // Compute K.T @ Q_u
+            VecX KtQ_u; KtQ_u.setZero();
+            for (int r = 0; r < STATE_DIM; ++r) {
+                for (int c = 0; c < CONTROL_DIM; ++c) {
+                    KtQ_u(r) += K[i](c, r) * Q_u(c);
+                }
+            }
+
+            // Compute Q_ux.T @ d
+            VecX Q_uxt_d; Q_uxt_d.setZero();
+            for (int r = 0; r < STATE_DIM; ++r) {
+                for (int c = 0; c < CONTROL_DIM; ++c) {
+                    Q_uxt_d(r) += Q_ux(c, r) * d[i](c);
+                }
+            }
+
+            V_x = Q_x + KtQ_uu_d + KtQ_u + Q_uxt_d;
+
+            // V_xx = Q_xx + K.T @ Q_uu @ K + K.T @ Q_ux + Q_ux.T @ K
+
+            // Compute K.T @ Q_uu @ K (4x4 = 4x2 @ 2x2 @ 2x4)
+            MatrixLXX KtQ_uu_K; KtQ_uu_K.setZero();
+            for (int r = 0; r < STATE_DIM; ++r) {
+                for (int c = 0; c < 4; ++c) {
+                    for (int k = 0; k < CONTROL_DIM; ++k) {
+                        for (int l = 0; l < 2; ++l) {
+                            KtQ_uu_K(r, c) += K[i](k, r) * Q_uu(k, l) * K[i](l, c);
+                        }
+                    }
+                }
+            }
+
+            // Compute K.T @ Q_ux (4x4 = 4x2 @ 2x4)
+            MatrixLXX KtQ_ux; KtQ_ux.setZero();
+            for (int r = 0; r < STATE_DIM; ++r) {
+                for (int c = 0; c < 4; ++c) {
+                    for (int k = 0; k < CONTROL_DIM; ++k) {
+                        KtQ_ux(r, c) += K[i](k, r) * Q_ux(k, c);
+                    }
+                }
+            }
+
+            // Compute Q_ux.T @ K (4x4 = 4x2 @ 2x4)
+            MatrixLXX Q_uxt_K; Q_uxt_K.setZero();
+            for (int r = 0; r < STATE_DIM; ++r) {
+                for (int c = 0; c < 4; ++c) {
+                    for (int k = 0; k < CONTROL_DIM; ++k) {
+                        Q_uxt_K(r, c) += Q_ux(k, r) * K[i](k, c);
+                    }
+                }
+            }
+
+            V_xx = Q_xx + KtQ_uu_K + KtQ_ux + Q_uxt_K;
+
+            // Expected cost reduction (Python: 0.5 * d.T @ Q_uu @ d + d.T @ Q_u)
+            double d_Q_uu_d = 0.0;
+            for (int k = 0; k < CONTROL_DIM; ++k) {
+                for (int l = 0; l < 2; ++l) {
+                    d_Q_uu_d += d[i](k) * Q_uu(k, l) * d[i](l);
+                }
+            }
+            double d_Q_u = d[i].transpose() * Q_u;
+            delt_V += 0.5 * d_Q_uu_d + d_Q_u;
+        }
+
+        return true;
+    }
+
+    /**
+     * @brief Forward pass: line search to apply gains
+     *
+     * Applies the computed gains with a given step size (alpha)
+     * and forward propagates the dynamics.
+     *
+     * @param controls Current control trajectory
+     * @param states Current state trajectory
+     * @param d Feedforward gains
+     * @param K Feedback gains
+     * @param alpha Step size
+     * @param new_controls Output: new control trajectory
+     * @param new_states Output: new state trajectory
+     * @return true if successful
+     */
+    bool forward_pass(const Controls& controls,
+                      const States& states,
+                      const Controls& d,
+                      const MatrixCUXs& K,
+                      double alpha,
+                      Controls& new_controls,
+                      States& new_states) {
+        // Resize outputs
+        new_controls.resize(horizon_);
+        new_states.resize(horizon_ + 1);
+
+        // Initial state
+        new_states[0] = states[0];
+
+        // Forward propagate
+        for (int i = 0; i < horizon_; ++i) {
+            // Compute new control
+            State delta_x = new_states[i] - states[i];
+            Control new_u = controls[i] + alpha * d[i] + K[i] * delta_x;
+            new_controls[i] = new_u;
+
+            // Forward dynamics
+            new_states[i + 1] = model_->forward_calculation(new_states[i], new_controls[i]);
+        }
+
+        return true;
+    }
+
+    /**
+     * @brief One iteration with line search and adaptive regularization
+     *
+     * Performs backward pass, then tries different alphas for line search.
+     * Adjusts lambda based on whether cost reduction was achieved.
+     *
+     * @param controls Current control trajectory
+     * @param states Current state trajectory
+     * @param J Current cost
+     * @param lambda Current regularization parameter
+     * @param new_controls Output: new control trajectory
+     * @param new_states Output: new state trajectory
+     * @param new_J Output: new cost
+     * @return true if iteration was effective (cost reduced)
+     */
+    bool iter(const Controls& controls,
+              const States& states,
+              double J,
+              double& lambda,
+              Controls& new_controls,
+              States& new_states,
+              double& new_J) {
+        // Backward pass
+        Controls d;
+        MatrixCUXs K;
+        double delt_V;
+
+        if (!backward_pass(controls, states, lambda, d, K, delt_V)) {
+            // Backward pass failed, amplify lambda
+            lambda *= lamb_amplify_;
+            return false;
+        }
+
+        // Try different alphas
+        bool iter_effective = false;
+        for (double alpha : alpha_options_) {
+            if (forward_pass(controls, states, d, K, alpha, new_controls, new_states)) {
+                new_J = cost_calculator_->CalculateTotalCost(new_states, new_controls);
+
+                if (new_J < J) {
+                    iter_effective = true;
+                    break;
+                }
             }
         }
 
-        return {d, std::move(K), delt_V};
-    }
-
-    std::pair<Controls, States> forward_pass(const Controls& u, const States& x,
-                                             const Controls& d,
-                                             const std::vector<Matrix<T, 2, 4>>& K,
-                                             T alpha) {
-        Controls new_u = Controls::Zero(N_, 2);
-        States new_x = States::Zero(N_ + 1, 4);
-        new_x.row(0) = x.row(0);
-
-        for (int i = 0; i < N_; ++i) {
-            VecU new_u_i = u.row(i).transpose() +
-                             alpha * d.row(i).transpose() +
-                             K[i] * (new_x.row(i).transpose() - x.row(i).transpose());
-            new_u.row(i) = new_u_i.transpose();
-
-            // Convert row to State type for forward_calculation
-            typename KinematicModelType::State state_i = new_x.row(i).transpose();
-            typename KinematicModelType::Control ctrl_i = new_u.row(i).transpose();
-            typename KinematicModelType::State next_state = model_->forward_calculation(state_i, ctrl_i, dt_);
-            new_x.row(i + 1) = next_state.transpose();
+        // Adjust lambda
+        if (iter_effective) {
+            lambda *= lamb_decay_;
+        } else {
+            lambda *= lamb_amplify_;
         }
 
-        return {new_u, new_x};
+        return iter_effective;
     }
 
-    KinematicModelType* model_;
-    CostCalculatorType* cost_func_;
+    /**
+     * @brief Main solver loop
+     *
+     * Iterates until convergence, max iterations, or lambda exceeds max.
+     *
+     * @param x0 Initial state
+     * @param controls Output: optimal control trajectory
+     * @param states Output: optimal state trajectory
+     * @return true if converged successfully
+     */
+    bool solve(const State& x0, Controls& controls, States& states) {
+        // Initialize with zero controls
+        controls.resize(horizon_);
+        Control zero_control = Control::Zero();
+        for (int i = 0; i < horizon_; ++i) {
+            controls[i] = zero_control;
+        }
 
-    // Parameters
-    int N_;
-    T dt_;
+        // Forward propagate to get initial trajectory
+        states = model_->init_traj(x0, controls);
+
+        // Calculate initial cost
+        double J = cost_calculator_->CalculateTotalCost(states, controls);
+
+        // Initialize lambda
+        double lambda = init_lamb_;
+
+        std::cout << "Initial cost: " << J << ", Lambda: " << lambda << std::endl;
+
+        // Main iteration loop
+        for (int itr = 0; itr < max_iter_; ++itr) {
+            Controls new_controls;
+            States new_states;
+            double new_J;
+            bool iter_effective;
+
+            iter_effective = iter(controls, states, J, lambda, new_controls, new_states, new_J);
+
+            std::cout << "Iteration " << itr << ", Cost: " << new_J
+                      << ", Lambda: " << lambda
+                      << ", Effective: " << (iter_effective ? "Yes" : "No") << std::endl;
+
+            if (iter_effective) {
+                controls = new_controls;
+                states = new_states;
+                double J_old = J;
+                J = new_J;
+
+                // Check convergence
+                if (std::abs(J - J_old) < tol_) {
+                    std::cout << "Converged! Tolerance condition satisfied at iteration " << itr << std::endl;
+                    return true;
+                }
+            } else {
+                if (lambda > max_lamb_) {
+                    std::cout << "Regularization parameter reached maximum." << std::endl;
+                    return false;
+                }
+            }
+        }
+
+        std::cout << "Reached maximum iterations." << std::endl;
+        return true;
+    }
+
+    // Getters
+    int get_horizon() const { return horizon_; }
+    double get_dt() const { return dt_; }
+    int get_max_iter() const { return max_iter_; }
+    double get_init_lamb() const { return init_lamb_; }
+    double get_lamb_decay() const { return lamb_decay_; }
+    double get_lamb_amplify() const { return lamb_amplify_; }
+    double get_max_lamb() const { return max_lamb_; }
+    double get_tol() const { return tol_; }
+
+    // Setters
+    void set_max_iter(int max_iter) { max_iter_ = max_iter; }
+    void set_init_lamb(double init_lamb) { init_lamb_ = init_lamb; }
+    void set_lamb_decay(double lamb_decay) { lamb_decay_ = lamb_decay; }
+    void set_lamb_amplify(double lamb_amplify) { lamb_amplify_ = lamb_amplify; }
+    void set_max_lamb(double max_lamb) { max_lamb_ = max_lamb; }
+    void set_tol(double tol) { tol_ = tol; }
+    void set_alpha_options(const std::vector<double>& alphas) { alpha_options_ = alphas; }
+
+private:
+    KinematicModel* model_;
+    CostCalculator* cost_calculator_;
+
+    int horizon_;
+    int state_dim_;
+    int control_dim_;
+    double dt_;
+
+    // Solver parameters
     int max_iter_;
-    T init_lamb_;
-    T lamb_decay_;
-    T lamb_amplify_;
-    T max_lamb_;
-    std::vector<T> alpha_options_;
-    T tol_;
+    double init_lamb_;
+    double lamb_decay_;
+    double lamb_amplify_;
+    double max_lamb_;
+    double tol_;
+    std::vector<double> alpha_options_;
 };
 
 } // namespace ilqr
+
+#endif // ILQR_ILQR_SOLVER_HPP
