@@ -2,6 +2,18 @@
 
 A Python implementation of Augmented Lagrangian Method (ALM) combined with Iterative Linear Quadratic Regulator (iLQR) for constrained trajectory optimization of autonomous vehicles.
 
+## Demo
+
+### Dynamic MPC Simulation
+![Simulation GIF](simulation.gif)
+
+The animation shows the vehicle (blue) navigating around moving obstacles (red) using Model Predictive Control with ALM iLQR trajectory optimization.
+
+### Single-Shot Trajectory Planning
+![Vehicle Trajectory](vehicle_trajectory.png)
+
+Visualization of a single-shot trajectory planning result with static obstacles, showing the vehicle's planned path and orientation at each timestep.
+
 ## Features
 
 - **Two-loop ALM optimization**: Outer loop enforces constraints via multiplier updates, inner loop performs iLQR optimization
@@ -14,13 +26,15 @@ A Python implementation of Augmented Lagrangian Method (ALM) combined with Itera
 
 ```bash
 cd ALM_ilqr_v3
+pip install numpy matplotlib
 ```
 
-Requires:
+Requirements:
 - Python 3.8+
 - numpy
 - matplotlib
-- scripts_new/ module (parent directory dependency)
+
+**Note**: This is a self-contained package with no external dependencies.
 
 ## Usage
 
@@ -78,10 +92,14 @@ This package follows Google Python Style Guide:
 ```
 ALM_ilqr_v3/
 ├── __init__.py              # Package initialization
+├── model_base.py            # Abstract base class for kinematic models
+├── obstacle.py              # Obstacle class with ellipsoidal safety margins
+├── alm_model.py             # ALM vehicle model implementation
 ├── alm_ilqr_core.py         # ALM iLQR solver implementation
-├── alm_model.py             # ALM vehicle model
-├── simulation_animation.py  # Dynamic simulation with animation
 ├── planning_main.py         # Single-shot planning demo
+├── simulation_animation.py  # Dynamic simulation with animation
+├── simulation.gif           # Generated animation demo
+├── vehicle_trajectory.png   # Generated trajectory visualization
 └── README.md                # This file
 ```
 
