@@ -17,7 +17,8 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Polygon
 
 from alm_ilqr_core import ALMILQRCore
-from ALM_Model_v2 import ALMModelV2
+# from ALM_Model_v2 import ALMModelV2 as ALMModel
+from alm_model import ALMModel
 from obstacle import Obstacle
 
 
@@ -39,7 +40,7 @@ CONFIG = {
     'dt': 0.1,
     'Q': np.diag([0.0, 1.0, 0.5, 0.0, 0.0]),
     'R': np.diag([1.0, 1.0]),
-    'ref_velo': 6.0,
+    'ref_velo': 8.0,
     'state_dim': 5,
     'control_dim': 2,
     'wheelbase': WHEELBASE,
@@ -128,7 +129,7 @@ def run_planning() -> Tuple[np.ndarray, np.ndarray, list, list]:
 
     # Obstacle states [x, y, v, yaw]
     obs_1 = [8, -0.2, 3, -0.0]
-    obs_2 = [20, 4, -2.0, 0]
+    obs_2 = [20, 4, 2.0, 0]
 
     obstacle_list = [
         Obstacle(obs_1, obstacle_attr_1),
@@ -136,7 +137,7 @@ def run_planning() -> Tuple[np.ndarray, np.ndarray, list, list]:
     ]
 
     # Create model
-    model = ALMModelV2(CONFIG)
+    model = ALMModel(CONFIG)
     ego_state = [0.0, 0.0, 5.0, 0.0, 0]  # [x, y, v, phi, yaw]
 
     init_control = np.zeros((60, 2))

@@ -21,6 +21,7 @@ Example:
 from typing import TYPE_CHECKING, Dict, List, Tuple
 
 import numpy as np
+from model_base import ModelBase
 
 if TYPE_CHECKING:
     from alm_model import ALMModel
@@ -54,7 +55,7 @@ class ALMILQRCore:
         control_dim: Control vector dimension.
     """
 
-    def __init__(self, model: 'ALMModel', config: Dict) -> None:
+    def __init__(self, model: ModelBase, config: Dict) -> None:
         """Initialize the ALM iLQR solver.
 
         Args:

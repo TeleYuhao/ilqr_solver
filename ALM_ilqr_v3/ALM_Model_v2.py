@@ -553,3 +553,24 @@ class ALMModelV2(ModelBase):
             lxxs[i] = lxx_prime
 
         return lxs, lus, lxxs, luus, luxs
+    def update_mu(self, states, controls, obstacles):
+        I_mu_next = self.i_mu.copy()
+        constraint_dim = 2 * self.control_dim + 2 + 2 * len(obstacles)
+        for i in range(1, self.horizon + 1):
+            constraint = self.compute_constraint(states,controls,obstacles,i)
+            for j in range(constraint_dim):
+                if self.lambda_alm[i - 1, j] == 0 and constraint[j] <= 0:
+                    I_mu_next[i - 1 ,j, j] = 0
+                else:
+                    I_mu_next[i - 1 ,j, j] = self.mu
+
+        self.i_mu = I_mu_next
+    
+    def update_mu_scalar(self, factor = 2):
+        self.mu *= factor
+        # Update I_mu diagonal elements with new mu value
+        # Only update non-zero diagonal elements (active constraints)
+        for i in range(self.horizon):
+            for j in range(self.i_mu.shape[1]):
+                if self.i_mu[i, j, j] > 0:  # Active constraint
+                    self.i_mu[i, j, j] = self.mu

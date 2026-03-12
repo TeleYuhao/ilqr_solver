@@ -23,7 +23,8 @@ from matplotlib.patches import Polygon
 import numpy as np
 
 from alm_ilqr_core import ALMILQRCore
-from alm_model import ALMModel
+# from alm_model import ALMModel
+from ALM_Model_v2 import ALMModelV2 as ALMModel
 from obstacle import Obstacle
 
 
@@ -45,7 +46,7 @@ CONFIG: Dict = {
     'dt': 0.1,
     'Q': np.diag([0.0, 1.0, 0.5, 0.0, 0.0]),
     'R': np.diag([1.0, 1.0]),
-    'ref_velo': 5.0,
+    'ref_velo': 8.0,
     'state_dim': 5,
     'control_dim': 2,
     'wheelbase': WHEELBASE,
@@ -58,8 +59,8 @@ CONFIG: Dict = {
     'armijo_beta': 0.5,
     'armijo_alpha_min': 1e-1,
     'init_lamb': 20.0,
-    'max_alm_iters': 8,
-    'max_ilqr_iters': 8,
+    'max_alm_iters': 10,
+    'max_ilqr_iters': 10,
     'violation_tol': 1e-4,
     'small_violation_threshold': 1e-2,
     'mu_gain': 8,
@@ -158,8 +159,10 @@ def run_simulation() -> Tuple[Dict, np.ndarray, List[Dict]]:
     obstacle_attr_2 = np.array([VEHICLE_WIDTH, VEHICLE_LENGTH, SAFETY_BUFFER])
 
     # Obstacle states [x, y, v, yaw]
-    obs_1 = [9, -0.2, 1, -0.0]
+    obs_1 = [8, -0.2, 3, -0.0]
     obs_2 = [20, 4, 2.0, 0]
+    # obs_1 = [8, -0.2, 3, -0.0]
+    # obs_2 = [20, 4, -2.0, 0]
 
     obstacle_list_init = [
         Obstacle(obs_1, obstacle_attr_1),
