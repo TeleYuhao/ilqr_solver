@@ -17,7 +17,7 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Polygon
 
 from alm_ilqr_core import ALMILQRCore
-from alm_model import ALMModel
+from ALM_Model_v2 import ALMModelV2
 from obstacle import Obstacle
 
 
@@ -127,8 +127,8 @@ def run_planning() -> Tuple[np.ndarray, np.ndarray, list, list]:
     obstacle_attr_2 = np.array([VEHICLE_WIDTH, VEHICLE_LENGTH, SAFETY_BUFFER])
 
     # Obstacle states [x, y, v, yaw]
-    obs_1 = [10, -0.2, 3, -0.0]
-    obs_2 = [20, 4, 2.0, 0]
+    obs_1 = [8, -0.2, 3, -0.0]
+    obs_2 = [20, 4, -2.0, 0]
 
     obstacle_list = [
         Obstacle(obs_1, obstacle_attr_1),
@@ -136,7 +136,7 @@ def run_planning() -> Tuple[np.ndarray, np.ndarray, list, list]:
     ]
 
     # Create model
-    model = ALMModel(CONFIG)
+    model = ALMModelV2(CONFIG)
     ego_state = [0.0, 0.0, 5.0, 0.0, 0]  # [x, y, v, phi, yaw]
 
     init_control = np.zeros((60, 2))
