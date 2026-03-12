@@ -162,6 +162,39 @@ class ModelBase(ABC):
         pass
 
     @abstractmethod
+    def compute_constraint(
+        self,
+        states: np.ndarray,
+        controls: np.ndarray,
+        obstacles: List,
+        step: int
+    ) -> np.ndarray:
+        """Compute constraint values at a specific timestep.
+
+        Args:
+            states: State trajectory.
+            controls: Control sequence.
+            obstacles: Obstacle objects.
+            step: Timestep index (1 to horizon).
+
+        Returns:
+            Constraint values (positive means violation).
+        """
+        pass
+
+    @abstractmethod
+    def _projection(self, x: np.ndarray) -> np.ndarray:
+        """Project vector onto non-positive orthant.
+
+        Args:
+            x: Input vector.
+
+        Returns:
+            Projected vector (max(x, 0) becomes 0).
+        """
+        pass
+
+    @abstractmethod
     def get_center(self, state: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Compute front and rear axle center positions.
 
@@ -312,3 +345,81 @@ class ModelBase(ABC):
             bound_type: Either 'upper' or 'lower'.
         """
         pass
+
+    def init_multipliers(self, constraint_dim: int) -> None:
+        """Initialize ALM multipliers and penalty matrices.
+
+        Args:
+            constraint_dim: Dimension of the constraint vector.
+        """
+        self.mu = 1.0
+        self.i_mu = np.stack(
+            [np.eye(constraint_dim) for _ in range(self.horizon)], axis=0
+        )
+        self.lambda_alm = np.zeros((self.horizon, constraint_dim))
+
+    def update_lambda(
+        self,
+        states: np.ndarray,
+        controls: np.ndarray,
+        obstacles: List
+    ) -> None:
+        """Update Lagrange multipliers using projected gradient step.
+
+        Args:
+            states: State trajectory.
+            controls: Control sequence.
+            obstacles: List of obstacle objects.
+        """
+        for i in range(1, self.horizon + 1):
+            constraint = self.compute_constraint(states, controls, obstacles, i)
+            self.lambda_alm[i - 1] = self._projection(
+                self.lambda_alm[i - 1] - self.mu * constraint
+            )
+
+    def update_mu(
+        self,
+        states: np.ndarray,
+        controls: np.ndarray,
+        obstacles: List
+    ) -> None:
+        """Update penalty matrix I_mu based on active constraints.
+
+        Only constraints with positive multiplier or violation are penalized.
+
+        Args:
+            states: State trajectory.
+            controls: Control sequence.
+            obstacles: List of obstacle objects.
+        """
+        if not hasattr(self, 'i_mu'):
+            constraint_dim = 2 * self.control_dim + 2 + 2 * len(obstacles)
+            self.init_multipliers(constraint_dim)
+
+        i_mu_next = self.i_mu.copy()
+        constraint_dim = 2 * self.control_dim + 2 + 2 * len(obstacles)
+
+        for i in range(1, self.horizon + 1):
+            constraint = self.compute_constraint(states, controls, obstacles, i)
+            for j in range(constraint_dim):
+                if self.lambda_alm[i - 1, j] == 0 and constraint[j] <= 0:
+                    i_mu_next[i - 1, j, j] = 0
+                else:
+                    i_mu_next[i - 1, j, j] = self.mu
+
+        self.i_mu = i_mu_next
+
+    def update_mu_scalar(self, factor: float = 2.0) -> None:
+        """Increase penalty parameter mu by multiplicative factor.
+
+        Called when constraint violation is large to increase penalty weight
+        and force constraint satisfaction.
+
+        Args:
+            factor: Multiplicative factor for increasing mu.
+        """
+        self.mu *= factor
+        for i in range(self.horizon):
+            for j in range(self.i_mu.shape[1]):
+                if self.i_mu[i, j, j] > 0:
+                    self.i_mu[i, j, j] = self.mu

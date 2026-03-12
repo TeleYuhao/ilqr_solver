@@ -140,84 +140,6 @@ class ALMModel(ModelBase):
 
         return a_matrix, b_matrix
 
-    def init_multipliers(self, obstacles: List[Obstacle]) -> None:
-        """Initialize ALM multipliers and penalty matrices.
-
-        Args:
-            obstacles: List of obstacle objects for determining constraint dimension.
-        """
-        constraint_dim = (2 * self.control_dim + 2 + 2 * len(obstacles))
-        self.mu = 1.0
-        self.i_mu = np.stack(
-            [np.eye(constraint_dim) for _ in range(self.horizon)], axis=0
-        )
-        self.lambda_alm = np.zeros((self.horizon, constraint_dim))
-
-    def update_lambda(
-        self,
-        states: np.ndarray,
-        controls: np.ndarray,
-        obstacles: List[Obstacle]
-    ) -> None:
-        """Update Lagrange multipliers using projected gradient step.
-
-        Args:
-            states: State trajectory.
-            controls: Control sequence.
-            obstacles: List of obstacle objects.
-        """
-        for i in range(1, self.horizon + 1):
-            constraint = self.compute_constraint(states, controls, obstacles, i)
-            self.lambda_alm[i - 1] = self._projection(
-                self.lambda_alm[i - 1] - self.mu * constraint
-            )
-
-    def update_mu(
-        self,
-        states: np.ndarray,
-        controls: np.ndarray,
-        obstacles: List[Obstacle]
-    ) -> None:
-        """Update penalty matrix I_mu based on active constraints.
-
-        Only constraints with positive multiplier or violation are penalized.
-
-        Args:
-            states: State trajectory.
-            controls: Control sequence.
-            obstacles: List of obstacle objects.
-        """
-        if not hasattr(self, 'i_mu'):
-            self.init_multipliers(obstacles)
-
-        i_mu_next = self.i_mu.copy()
-        constraint_dim = 2 * self.control_dim + 2 + 2 * len(obstacles)
-
-        for i in range(1, self.horizon + 1):
-            constraint = self.compute_constraint(states, controls, obstacles, i)
-            for j in range(constraint_dim):
-                if self.lambda_alm[i - 1, j] == 0 and constraint[j] <= 0:
-                    i_mu_next[i - 1, j, j] = 0
-                else:
-                    i_mu_next[i - 1, j, j] = self.mu
-
-        self.i_mu = i_mu_next
-
-    def update_mu_scalar(self, factor: float = 2.0) -> None:
-        """Increase penalty parameter mu by multiplicative factor.
-
-        Called when constraint violation is large to increase penalty weight
-        and force constraint satisfaction.
-
-        Args:
-            factor: Multiplicative factor for increasing mu.
-        """
-        self.mu *= factor
-        for i in range(self.horizon):
-            for j in range(self.i_mu.shape[1]):
-                if self.i_mu[i, j, j] > 0:
-                    self.i_mu[i, j, j] = self.mu
-
     def compute_violation(
         self,
         states: np.ndarray,
@@ -339,11 +261,11 @@ class ALMModel(ModelBase):
         x, y, v, phi, yaw = states[step]
         a, omega = controls[step - 1]
 
-        acc_up_constraint = self.get_bound_constr(a, self.config['acc_max'], 'upper')
-        acc_low_constraint = self.get_bound_constr(a, self.config['acc_min'], 'lower')
+        acc_up_constraint   = self.get_bound_constr(a, self.config['acc_max'], 'upper')
+        acc_low_constraint  = self.get_bound_constr(a, self.config['acc_min'], 'lower')
         omega_up_constraint = self.get_bound_constr(omega, self.config['omega_max'], 'upper')
         omega_low_constraint = self.get_bound_constr(omega, self.config['omega_min'], 'lower')
-        velo_up_constraint = self.get_bound_constr(v, self.config['v_max'], 'upper')
+        velo_up_constraint  = self.get_bound_constr(v, self.config['v_max'], 'upper')
         velo_low_constraint = self.get_bound_constr(v, self.config['v_min'], 'lower')
 
         constraints = [

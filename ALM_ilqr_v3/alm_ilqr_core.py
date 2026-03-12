@@ -272,7 +272,8 @@ class ALMILQRCore:
                 f"{self.horizon}"
             )
 
-        self.model.init_multipliers(obstacles)
+        constraint_dim = 2 * self.model.control_dim + 2 + 2 * len(obstacles)
+        self.model.init_multipliers(constraint_dim)
         u, x = controls, states
         trajectory_history = [x.copy()]
         cost_history = [
